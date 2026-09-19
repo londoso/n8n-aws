@@ -1,0 +1,161 @@
+name: Deploy n8n
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-n8n
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: n8n
+  ROLE_ARN: arn:aws:iam::862807499233:role/github-oidc-provider-aws
+
+jobs:
+  infra:
+    name: Provision infrastructure (CloudFormation)
+    runs-on: ubuntu-latest
+    outputs:
+      instance_id: ${{ steps.outputs.outputs.instance_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file infra/cloudformation.yaml \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              ProjectName=n8n \
+              HostedZoneName=londoso.com \
+              DomainName=n8n.londoso.com
+
+      - name: Read stack outputs
+        id: outputs
+        run: |
+          INSTANCE_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \
+            --output text)
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Instance: $INSTANCE_ID"
+
+  deploy:
+    name: Deploy compose stack (SSM)
+    needs: infra
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for instance to be SSM-managed
+        run: |
+          INSTANCE_ID="${{ needs.infra.outputs.instance_id }}"
+          echo "Waiting for $INSTANCE_ID to register with SSM..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text 2>/dev/null || echo "None")
+            if [ "$STATUS" = "Online" ]; then
+              echo "Instance is online in SSM."
+              exit 0
+            fi
+            echo "  attempt $i: status=$STATUS, retrying in 10s..."
+            sleep 10
+          done
+          echo "Instance did not become SSM-managed in time." >&2
+          exit 1
+
+      - name: Build .env from secrets
+        run: |
+          cat > .env <<EOF
+          DOMAIN_NAME=n8n.londoso.com
+          ACME_EMAIL=${{ secrets.ACME_EMAIL }}
+          POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+          N8N_BASIC_AUTH_USER=${{ secrets.N8N_BASIC_AUTH_USER }}
+          N8N_BASIC_AUTH_PASSWORD=${{ secrets.N8N_BASIC_AUTH_PASSWORD }}
+          N8N_ENCRYPTION_KEY=${{ secrets.N8N_ENCRYPTION_KEY }}
+          GENERIC_TIMEZONE=${{ secrets.GENERIC_TIMEZONE }}
+          EOF
+
+      - name: Package compose files
+        run: |
+          tar -czf bundle.tar.gz compose.yml Caddyfile .env
+          base64 -w0 bundle.tar.gz > bundle.b64 || base64 bundle.tar.gz | tr -d '\n' > bundle.b64
+          echo "Bundle size: $(wc -c < bundle.b64) bytes (base64)"
+
+      - name: Push bundle to instance and (re)start stack via SSM
+        run: |
+          INSTANCE_ID="${{ needs.infra.outputs.instance_id }}"
+          B64=$(cat bundle.b64)
+
+          # Guard against SSM command size limits (documents cap ~100KB).
+          if [ "${#B64}" -gt 90000 ]; then
+            echo "Bundle too large for inline SSM. Consider S3-based transfer." >&2
+            exit 1
+          fi
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy n8n compose stack" \
+            --parameters commands="[
+              \"set -euxo pipefail\",
+              \"mkdir -p /opt/n8n\",
+              \"echo $B64 | base64 -d > /tmp/bundle.tar.gz\",
+              \"tar -xzf /tmp/bundle.tar.gz -C /opt/n8n\",
+              \"chown -R ec2-user:ec2-user /opt/n8n\",
+              \"cd /opt/n8n\",
+              \"/usr/local/bin/podman-compose pull\",
+              \"systemctl restart n8n-stack.service\",
+              \"sleep 5\",
+              \"/usr/local/bin/podman-compose ps\"
+            ]" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command: $CMD_ID"
+          aws ssm wait command-executed \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" || true
+
+          echo "----- STDOUT -----"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" --output text
+          echo "----- STDERR -----"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardErrorContent" --output text
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "Status" --output text)
+          echo "Final status: $STATUS"
+          [ "$STATUS" = "Success" ]

@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  n8n single-node on EC2 with Podman + podman-compose. Includes a dedicated VPC,
+  public subnet, security group, Elastic IP, IAM instance profile for SSM, and a
+  Route53 A record for the n8n subdomain. Designed for easy testing via compose.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: n8n
+    Description: Prefix used for tagging and naming resources.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: EC2 instance type. t3.small (2GB) is a reasonable minimum for n8n + Postgres.
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI resolved from SSM Public Parameters.
+
+  HostedZoneName:
+    Type: String
+    Default: londoso.com
+    Description: The Route53 hosted zone name (without trailing dot).
+
+  DomainName:
+    Type: String
+    Default: n8n.londoso.com
+    Description: Fully qualified domain name for n8n.
+
+  VolumeSizeGb:
+    Type: Number
+    Default: 20
+    Description: Root EBS volume size in GB (holds container images + Postgres data).
+
+  AllowedHttpCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR allowed to reach ports 80/443. Keep 0.0.0.0/0 so Let's Encrypt (HTTP-01)
+      and your browser can reach n8n. Restrict if you use a fixed egress IP.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-rt"
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} instance SG - HTTP/HTTPS inbound"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedHttpCidr
+          Description: HTTP (Let's Encrypt HTTP-01 + redirect)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedHttpCidr
+          Description: HTTPS (n8n via Caddy)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-sg"
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-instance-role"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-eip"
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSizeGb
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf update -y
+          dnf install -y podman git
+
+          # podman-compose via pip (podman-compose is not in AL2023 default repos)
+          dnf install -y python3-pip
+          pip3 install podman-compose
+
+          # Enable the podman socket (docker-compose compatibility)
+          systemctl enable --now podman.socket
+
+          # App directory where GitHub Actions will sync compose files
+          mkdir -p /opt/n8n
+          chown ec2-user:ec2-user /opt/n8n
+
+          # systemd unit to bring the stack up on boot / reboot
+          cat >/etc/systemd/system/n8n-stack.service <<'UNIT'
+          [Unit]
+          Description=n8n podman compose stack
+          After=network-online.target podman.socket
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          WorkingDirectory=/opt/n8n
+          ExecStart=/usr/local/bin/podman-compose up -d
+          ExecStop=/usr/local/bin/podman-compose down
+          TimeoutStartSec=0
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable n8n-stack.service
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-server"
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref Instance
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Sub "${HostedZoneName}."
+      Name: !Sub "${DomainName}."
+      Type: A
+      TTL: "300"
+      ResourceRecords:
+        - !Ref ElasticIp
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance id (used by GitHub Actions SSM deploy).
+    Value: !Ref Instance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
+
+  PublicIp:
+    Description: Elastic IP of the n8n server.
+    Value: !Ref ElasticIp
+
+  Url:
+    Description: n8n URL.
+    Value: !Sub "https://${DomainName}"

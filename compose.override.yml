@@ -1,0 +1,30 @@
+# Local development override (podman compose / docker compose pick this up
+# automatically from the repo root). It is NOT shipped to AWS: the deploy
+# workflow only bundles compose.yml + Caddyfile + .env.
+#
+# Purpose: expose n8n directly on http://localhost:5678 and skip Caddy/TLS,
+# since Let's Encrypt cannot issue a certificate for "localhost".
+#
+# Usage:
+#   cp .env.example .env   # then edit values for local
+#   podman compose up -d
+#   open http://localhost:5678
+
+services:
+  n8n:
+    ports:
+      - "5678:5678"
+    environment:
+      # Override the production HTTPS/domain settings for plain local HTTP.
+      N8N_HOST: localhost
+      N8N_PROTOCOL: http
+      N8N_EDITOR_BASE_URL: http://localhost:5678/
+      WEBHOOK_URL: http://localhost:5678/
+      # No reverse proxy in front locally.
+      N8N_PROXY_HOPS: "0"
+
+  # Caddy is only needed for public HTTPS. Locally we assign it to an inactive
+  # profile so `podman compose up` does not start it.
+  caddy:
+    profiles:
+      - donotstart

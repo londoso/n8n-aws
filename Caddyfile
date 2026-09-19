@@ -1,0 +1,9 @@
+# Caddy automatically provisions and renews a Let's Encrypt certificate
+# for {$DOMAIN_NAME} once the Route53 A record points at this server.
+{$DOMAIN_NAME} {
+	tls {$ACME_EMAIL}
+	encode gzip zstd
+	reverse_proxy n8n:5678 {
+		flush_interval -1
+	}
+}

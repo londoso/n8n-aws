@@ -1,0 +1,10 @@
+# Secrets - never commit the real env file
+.env
+
+# Build artifacts from the deploy workflow
+bundle.tar.gz
+bundle.b64
+
+# OS / editor
+.DS_Store
+*.swp
