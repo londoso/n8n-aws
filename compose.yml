@@ -35,10 +35,9 @@ services:
       N8N_EDITOR_BASE_URL: https://${DOMAIN_NAME}/
       WEBHOOK_URL: https://${DOMAIN_NAME}/
       N8N_PROXY_HOPS: "1"
-      # Basic auth for the editor (change in .env)
-      N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
-      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      # Access control: modern n8n uses its own user management (owner account
+      # created on first visit). The legacy N8N_BASIC_AUTH_* vars are deprecated.
+      N8N_USER_MANAGEMENT_DISABLED: "false"
       # Encryption key for stored credentials - MUST stay stable across restarts
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}

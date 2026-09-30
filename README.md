@@ -1,11 +1,14 @@
-# n8n on AWS (EC2 + Podman compose)
+# n8n on AWS (EC2 + Docker Compose)
 
-Single-node [n8n](https://n8n.io) running on an EC2 instance with Podman +
-podman-compose, fronted by Caddy for automatic HTTPS. Infrastructure is managed
+Single-node [n8n](https://n8n.io) running on an EC2 instance with Docker +
+Docker Compose, fronted by Caddy for automatic HTTPS. Infrastructure is managed
 with CloudFormation and deployed from GitHub Actions using OIDC (no long-lived
 AWS keys).
 
-- **Compute:** 1x EC2 (Amazon Linux 2023), Podman + podman-compose
+> The server runs Docker because Amazon Linux 2023 ships Docker (not Podman) in
+> its base repos. The same `compose.yml` works with `podman compose` locally.
+
+- **Compute:** 1x EC2 (Amazon Linux 2023), Docker + Docker Compose v2
 - **Stack:** n8n + Postgres 16 + Caddy (reverse proxy + Let's Encrypt TLS)
 - **Domain:** `n8n.londoso.com` (Route53 A record → Elastic IP)
 - **Region:** `us-east-1`
@@ -28,7 +31,7 @@ Internet ──HTTPS──▶ Caddy :443 ──▶ n8n :5678
                      (Let's Encrypt)      │
                                           ▼
                                    Postgres :5432
-   (all containers run via podman-compose on one EC2 instance)
+   (all containers run via docker compose on one EC2 instance)
 ```
 
 Only ports 80/443 are open to the internet. Postgres and n8n are reachable only
@@ -40,7 +43,8 @@ inside the compose network. Administrative access uses **SSM Session Manager**
 1. The Route53 hosted zone for `londoso.com` already exists in this account.
 2. The OIDC role `arn:aws:iam::862807499233:role/github-oidc-provider-aws` trusts
    this GitHub repo and has permissions for CloudFormation, EC2, IAM (create the
-   instance role), Route53, and SSM `SendCommand`.
+   instance role + instance profile, PassRole to EC2), Route53, and SSM
+   `SendCommand`. (These are bundled in the `n8n-deploy` managed policy.)
 3. GitHub repository **Secrets** are configured (see below).
 
 ## Required GitHub Secrets
@@ -49,14 +53,16 @@ Set these under **Settings → Secrets and variables → Actions**:
 
 | Secret | Example | Notes |
 |---|---|---|
+| `HOSTED_ZONE_ID` | `Z09788721KJRYG10EK3E2` | Route53 zone id for `londoso.com` |
 | `ACME_EMAIL` | `you@londoso.com` | Let's Encrypt expiry notices |
 | `POSTGRES_USER` | `n8n` | |
 | `POSTGRES_PASSWORD` | strong random | |
 | `POSTGRES_DB` | `n8n` | |
-| `N8N_BASIC_AUTH_USER` | `admin` | editor login |
-| `N8N_BASIC_AUTH_PASSWORD` | strong random | editor login |
 | `N8N_ENCRYPTION_KEY` | `openssl rand -hex 32` | **keep stable forever** |
 | `GENERIC_TIMEZONE` | `America/Bogota` | |
+
+The editor is protected by n8n's built-in user management: the first time you
+open `https://n8n.londoso.com` it prompts you to create the owner account.
 
 > The `N8N_ENCRYPTION_KEY` encrypts stored credentials. If it changes, existing
 > credentials become unreadable. Generate it once and never rotate it casually.
@@ -71,9 +77,9 @@ Run the workflow manually via **Actions → Deploy n8n → Run workflow**
 2. **deploy** — waits for the instance to register with SSM, builds `.env` from
    secrets, tars `compose.yml` + `Caddyfile` + `.env`, ships them to `/opt/n8n`
    on the instance, and restarts the `n8n-stack` systemd service (which runs
-   `podman-compose up -d`).
+   `docker compose up -d`).
 
-First run takes a few minutes: EC2 boot + Podman install + image pulls + Caddy
+First run takes a few minutes: EC2 boot + Docker install + image pulls + Caddy
 requesting the TLS cert. Once DNS resolves to the EIP, open:
 
 ```
@@ -108,8 +114,8 @@ Common commands on the host:
 
 ```bash
 cd /opt/n8n
-podman-compose ps
-podman-compose logs -f n8n
+docker compose ps
+docker compose logs -f n8n
 systemctl restart n8n-stack.service   # restart whole stack
 ```
 
@@ -125,7 +131,7 @@ volume:
 For a quick backup, dump Postgres:
 
 ```bash
-podman exec -t n8n_postgres_1 pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > backup.sql
+docker exec -t n8n-postgres-1 pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" > backup.sql
 ```
 
 For durability, consider moving Postgres to RDS later (the compose env vars

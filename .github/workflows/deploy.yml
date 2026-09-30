@@ -41,7 +41,7 @@ jobs:
             --no-fail-on-empty-changeset \
             --parameter-overrides \
               ProjectName=n8n \
-              HostedZoneName=londoso.com \
+              HostedZoneId=${{ secrets.HOSTED_ZONE_ID }} \
               DomainName=n8n.londoso.com
 
       - name: Read stack outputs
@@ -95,8 +95,6 @@ jobs:
           POSTGRES_USER=${{ secrets.POSTGRES_USER }}
           POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
           POSTGRES_DB=${{ secrets.POSTGRES_DB }}
-          N8N_BASIC_AUTH_USER=${{ secrets.N8N_BASIC_AUTH_USER }}
-          N8N_BASIC_AUTH_PASSWORD=${{ secrets.N8N_BASIC_AUTH_PASSWORD }}
           N8N_ENCRYPTION_KEY=${{ secrets.N8N_ENCRYPTION_KEY }}
           GENERIC_TIMEZONE=${{ secrets.GENERIC_TIMEZONE }}
           EOF
@@ -129,10 +127,10 @@ jobs:
               \"tar -xzf /tmp/bundle.tar.gz -C /opt/n8n\",
               \"chown -R ec2-user:ec2-user /opt/n8n\",
               \"cd /opt/n8n\",
-              \"/usr/local/bin/podman-compose pull\",
+              \"docker compose pull\",
               \"systemctl restart n8n-stack.service\",
               \"sleep 5\",
-              \"/usr/local/bin/podman-compose ps\"
+              \"docker compose ps\"
             ]" \
             --query "Command.CommandId" \
             --output text)
